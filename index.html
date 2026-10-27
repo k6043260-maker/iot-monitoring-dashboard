@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IoT Device Monitoring Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  body{font-family:system-ui,sans-serif;margin:0;background:#f4f6f8;color:#222}
+  header{background:#1f3a5f;color:#fff;padding:12px 20px;display:flex;justify-content:space-between;align-items:center}
+  main{max-width:1000px;margin:16px auto;padding:0 12px}
+  .card{background:#fff;border-radius:8px;padding:16px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+  input,button{padding:8px;margin:3px;border-radius:6px;border:1px solid #bbb}
+  button{background:#1f3a5f;color:#fff;border:none;cursor:pointer}
+  button.sec{background:#888}
+  .dev{display:inline-block;margin:4px;padding:8px 12px;border:1px solid #1f3a5f;border-radius:6px;cursor:pointer}
+  .dev.sel{background:#1f3a5f;color:#fff}
+  .alert{padding:8px;border-left:4px solid #d33;background:#fdecec;margin:6px 0;border-radius:4px}
+  .alert.ack{border-color:#999;background:#eee;color:#666}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<header><b>IoT Monitoring Dashboard</b><span id="who"></span></header>
+<main>
+  <div id="loginBox" class="card">
+    <h3>Login / Register</h3>
+    <input id="u" placeholder="Username"><input id="p" type="password" placeholder="Password (min 6)">
+    <button onclick="login()">Login</button><button class="sec" onclick="register()">Register</button>
+    <div id="msg"></div>
+  </div>
+
+  <div id="app" class="hidden">
+    <div class="card">
+      <h3>Devices <button class="sec" onclick="logout()">Logout</button></h3>
+      <div id="devices"></div>
+      <div id="adminForm" class="hidden">
+        <hr><b>Add device (admin)</b><br>
+        <input id="dn" placeholder="Name"><input id="dl" placeholder="Location">
+        <input id="ds" placeholder="Sensor type (e.g. temperature)"><input id="dt" type="number" placeholder="Threshold">
+        <button onclick="addDevice()">Add</button>
+        <button class="sec" onclick="delDevice()">Delete selected</button>
+        <div id="newKey"></div>
+      </div>
+    </div>
+    <div class="card"><h3 id="chartTitle">Select a device</h3><canvas id="chart" height="110"></canvas></div>
+    <div class="card"><h3>Alerts</h3><div id="alerts"></div></div>
+  </div>
+</main>
+<script>
+let token = localStorage.getItem('token'), role = localStorage.getItem('role');
+let chart = null, selected = null, devicesCache = [];
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function api(path, opts = {}) {
+  opts.headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  if (token) opts.headers.Authorization = 'Bearer ' + token;
+  const r = await fetch(path, opts);
+  if (r.status === 401) { logout(); throw new Error('Session expired'); }
+  return r;
+}
+
+async function authCall(path) {
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: $('u').value, password: $('p').value }) });
+  return { ok: r.ok, data: await r.json().catch(() => ({})) };
+}
+async function login() {
+  const { ok, data } = await authCall('/api/auth/login');
+  if (!ok) { $('msg').textContent = data.error || 'Login failed'; return; }
+  token = data.token; role = data.role;
+  localStorage.setItem('token', token); localStorage.setItem('role', role);
+  start();
+}
+async function register() {
+  const { ok, data } = await authCall('/api/auth/register');
+  $('msg').textContent = ok ? 'Registered. Now login.' : (data.error || 'Check username and 6+ char password');
+}
+function logout() {
+  token = role = null; localStorage.clear(); clearInterval(window.timer);
+  $('app').classList.add('hidden'); $('loginBox').classList.remove('hidden'); $('who').textContent = '';
+}
+
+async function loadDevices() {
+  devicesCache = await (await api('/api/devices')).json();
+  $('devices').innerHTML = devicesCache.map(d =>
+    `<span class="dev ${d.id === selected ? 'sel' : ''}" onclick="selectDevice(${d.id})">
+      ${esc(d.name)} <small>(${esc(d.sensorType)}, limit ${esc(d.threshold)})</small></span>`).join('') || 'No devices yet';
+}
+function selectDevice(id) { selected = id; loadDevices(); loadReadings(); }
+
+async function loadReadings() {
+  if (!selected) return;
+  const rows = await (await api(`/api/devices/${selected}/readings`)).json();
+  const dev = devicesCache.find(d => d.id === selected);
+  $('chartTitle').textContent = dev ? `${dev.name} - ${dev.sensorType}` : 'Readings';
+  const labels = rows.map(r => new Date(r.recordedAt).toLocaleTimeString());
+  const values = rows.map(r => r.value);
+  const limit = rows.map(() => dev ? dev.threshold : null);
+  if (chart) chart.destroy();
+  chart = new Chart($('chart'), { type: 'line',
+    data: { labels, datasets: [
+      { label: 'Value', data: values, borderColor: '#1f3a5f', tension: .3 },
+      { label: 'Threshold', data: limit, borderColor: '#d33', borderDash: [6, 6], pointRadius: 0 }] },
+    options: { animation: false } });
+}
+
+async function loadAlerts() {
+  const rows = await (await api('/api/alerts')).json();
+  $('alerts').innerHTML = rows.map(a =>
+    `<div class="alert ${a.acknowledged ? 'ack' : ''}">
+      <b>${esc(a.device.name)}</b>: ${esc(a.message)}
+      <small>${new Date(a.createdAt).toLocaleString()}</small>
+      ${a.acknowledged ? '' : `<button onclick="ack(${a.id})">Acknowledge</button>`}</div>`).join('') || 'No alerts';
+}
+async function ack(id) { await api(`/api/alerts/${id}/ack`, { method: 'PUT' }); loadAlerts(); }
+
+async function addDevice() {
+  const r = await api('/api/devices', { method: 'POST', body: JSON.stringify({
+    name: $('dn').value, location: $('dl').value, sensorType: $('ds').value, threshold: parseFloat($('dt').value) }) });
+  const d = await r.json();
+  $('newKey').textContent = r.ok ? `Device created. Save this API key now (shown once): ${d.apiKey}` : 'Failed: check fields';
+  loadDevices();
+}
+async function delDevice() {
+  if (!selected || !confirm('Delete selected device and its data?')) return;
+  await api(`/api/devices/${selected}`, { method: 'DELETE' });
+  selected = null; loadDevices(); loadAlerts();
+}
+
+function start() {
+  $('loginBox').classList.add('hidden'); $('app').classList.remove('hidden');
+  $('who').textContent = role === 'ROLE_ADMIN' ? 'Admin' : 'User';
+  $('adminForm').classList.toggle('hidden', role !== 'ROLE_ADMIN');
+  const refresh = () => { loadDevices(); loadReadings(); loadAlerts(); };
+  refresh(); clearInterval(window.timer); window.timer = setInterval(refresh, 5000);
+}
+if (token) start();
+</script>
+</body>
+</html>
